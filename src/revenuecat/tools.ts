@@ -1,85 +1,192 @@
+import { z } from "zod";
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import type { ToolHandler } from "../index.js";
 import { rcGet, defaultProjectId } from "./client.js";
+import { textResult, validated } from "../utils/tool.js";
+import type {
+  RcApp,
+  RcCustomer,
+  RcEntitlement,
+  RcListResponse,
+  RcProduct,
+  RcProject,
+} from "./types.js";
 
 type RegisterFn = (tool: Tool, handler: ToolHandler) => void;
 
-const projectIdSchema = {
-  type: "string",
-  description:
-    "RevenueCat project id. If omitted, RC_DEFAULT_PROJECT_ID from env is used.",
-} as const;
+// ---------------------------------------------------------------------------
+// Shared: project_id resolution
+// ---------------------------------------------------------------------------
 
-function resolveProjectId(args: Record<string, unknown>): string {
-  return (args.project_id as string) ?? defaultProjectId();
+/**
+ * The project_id arg is optional across every tool — if omitted, we fall
+ * back to RC_DEFAULT_PROJECT_ID. Users with multiple projects (Pedagogy /
+ * Magic World / StoryBox / ...) can either set the env or pass explicitly.
+ */
+const projectIdField = z
+  .string()
+  .min(1)
+  .optional()
+  .describe("RevenueCat project id. Defaults to RC_DEFAULT_PROJECT_ID env if unset.");
+
+function projectIdSchemaJson() {
+  return {
+    type: "string",
+    description:
+      "RevenueCat project id. If omitted, RC_DEFAULT_PROJECT_ID from env is used.",
+  } as const;
 }
 
-function json(obj: unknown) {
-  return { content: [{ type: "text" as const, text: JSON.stringify(obj, null, 2) }] };
+function resolveProjectId(args: { project_id?: string }): string {
+  return args.project_id ?? defaultProjectId();
 }
+
+// ---------------------------------------------------------------------------
+// Registration
+// ---------------------------------------------------------------------------
 
 export function registerRevenueCatTools(register: RegisterFn): void {
+  registerListProjects(register);
+  registerListApps(register);
+  registerListProducts(register);
+  registerListEntitlements(register);
+  registerListCustomers(register);
+  registerGetCustomer(register);
+  registerGetCustomerSubscriptions(register);
+  registerGetCustomerPurchases(register);
+  registerGetProjectSnapshot(register);
+}
+
+// ---------------------------------------------------------------------------
+// rc_list_projects
+// ---------------------------------------------------------------------------
+
+const listProjectsSchema = z.object({}).strict();
+
+function registerListProjects(register: RegisterFn): void {
   register(
     {
       name: "rc_list_projects",
       description: "List all RevenueCat projects your secret key has access to.",
       inputSchema: { type: "object", properties: {}, additionalProperties: false },
     },
-    async () => json(await rcGet<any>("/projects"))
+    validated(listProjectsSchema, async () =>
+      textResult(await rcGet<RcListResponse<RcProject>>("/projects"))
+    )
   );
+}
 
+// ---------------------------------------------------------------------------
+// rc_list_apps
+// ---------------------------------------------------------------------------
+
+const listAppsSchema = z
+  .object({ project_id: projectIdField })
+  .strict();
+
+function registerListApps(register: RegisterFn): void {
   register(
     {
       name: "rc_list_apps",
       description: "List all apps under a RevenueCat project (iOS, Android, web, etc).",
       inputSchema: {
         type: "object",
-        properties: { project_id: projectIdSchema },
+        properties: { project_id: projectIdSchemaJson() },
         additionalProperties: false,
       },
     },
-    async (args) => {
+    validated(listAppsSchema, async (args) => {
       const projectId = resolveProjectId(args);
-      return json(await rcGet<any>(`/projects/${projectId}/apps`));
-    }
+      return textResult(await rcGet<RcListResponse<RcApp>>(`/projects/${projectId}/apps`));
+    })
   );
+}
 
+// ---------------------------------------------------------------------------
+// rc_list_products
+// ---------------------------------------------------------------------------
+
+const listProductsSchema = z
+  .object({
+    project_id: projectIdField,
+    limit: z.number().int().min(1).max(100).default(50),
+    starting_after: z.string().optional(),
+  })
+  .strict();
+
+function registerListProducts(register: RegisterFn): void {
   register(
     {
       name: "rc_list_products",
-      description: "List products (SKUs) configured in a RevenueCat project.",
+      description:
+        "List products (SKUs) configured in a RevenueCat project. Paginate with starting_after " +
+        "(id of the last item from the previous page).",
       inputSchema: {
         type: "object",
         properties: {
-          project_id: projectIdSchema,
+          project_id: projectIdSchemaJson(),
           limit: { type: "integer", minimum: 1, maximum: 100, default: 50 },
+          starting_after: { type: "string" },
         },
         additionalProperties: false,
       },
     },
-    async (args) => {
+    validated(listProductsSchema, async (args) => {
       const projectId = resolveProjectId(args);
-      const limit = (args.limit as number) ?? 50;
-      return json(await rcGet<any>(`/projects/${projectId}/products?limit=${limit}`));
-    }
+      const qs = new URLSearchParams({ limit: String(args.limit) });
+      if (args.starting_after) qs.set("starting_after", args.starting_after);
+      return textResult(
+        await rcGet<RcListResponse<RcProduct>>(
+          `/projects/${projectId}/products?${qs.toString()}`
+        )
+      );
+    })
   );
+}
 
+// ---------------------------------------------------------------------------
+// rc_list_entitlements
+// ---------------------------------------------------------------------------
+
+const listEntitlementsSchema = z
+  .object({ project_id: projectIdField })
+  .strict();
+
+function registerListEntitlements(register: RegisterFn): void {
   register(
     {
       name: "rc_list_entitlements",
       description: "List entitlements configured in a RevenueCat project.",
       inputSchema: {
         type: "object",
-        properties: { project_id: projectIdSchema },
+        properties: { project_id: projectIdSchemaJson() },
         additionalProperties: false,
       },
     },
-    async (args) => {
+    validated(listEntitlementsSchema, async (args) => {
       const projectId = resolveProjectId(args);
-      return json(await rcGet<any>(`/projects/${projectId}/entitlements`));
-    }
+      return textResult(
+        await rcGet<RcListResponse<RcEntitlement>>(
+          `/projects/${projectId}/entitlements`
+        )
+      );
+    })
   );
+}
 
+// ---------------------------------------------------------------------------
+// rc_list_customers
+// ---------------------------------------------------------------------------
+
+const listCustomersSchema = z
+  .object({
+    project_id: projectIdField,
+    limit: z.number().int().min(1).max(100).default(50),
+    starting_after: z.string().optional(),
+  })
+  .strict();
+
+function registerListCustomers(register: RegisterFn): void {
   register(
     {
       name: "rc_list_customers",
@@ -88,22 +195,38 @@ export function registerRevenueCatTools(register: RegisterFn): void {
       inputSchema: {
         type: "object",
         properties: {
-          project_id: projectIdSchema,
+          project_id: projectIdSchemaJson(),
           limit: { type: "integer", minimum: 1, maximum: 100, default: 50 },
           starting_after: { type: "string" },
         },
         additionalProperties: false,
       },
     },
-    async (args) => {
+    validated(listCustomersSchema, async (args) => {
       const projectId = resolveProjectId(args);
-      const qs = new URLSearchParams();
-      qs.set("limit", String(args.limit ?? 50));
-      if (args.starting_after) qs.set("starting_after", String(args.starting_after));
-      return json(await rcGet<any>(`/projects/${projectId}/customers?${qs.toString()}`));
-    }
+      const qs = new URLSearchParams({ limit: String(args.limit) });
+      if (args.starting_after) qs.set("starting_after", args.starting_after);
+      return textResult(
+        await rcGet<RcListResponse<RcCustomer>>(
+          `/projects/${projectId}/customers?${qs.toString()}`
+        )
+      );
+    })
   );
+}
 
+// ---------------------------------------------------------------------------
+// rc_get_customer
+// ---------------------------------------------------------------------------
+
+const getCustomerSchema = z
+  .object({
+    project_id: projectIdField,
+    customer_id: z.string().min(1),
+  })
+  .strict();
+
+function registerGetCustomer(register: RegisterFn): void {
   register(
     {
       name: "rc_get_customer",
@@ -111,7 +234,7 @@ export function registerRevenueCatTools(register: RegisterFn): void {
       inputSchema: {
         type: "object",
         properties: {
-          project_id: projectIdSchema,
+          project_id: projectIdSchemaJson(),
           customer_id: {
             type: "string",
             description: "The app_user_id (or RevenueCat customer id) of the customer.",
@@ -121,12 +244,29 @@ export function registerRevenueCatTools(register: RegisterFn): void {
         additionalProperties: false,
       },
     },
-    async (args) => {
+    validated(getCustomerSchema, async (args) => {
       const projectId = resolveProjectId(args);
-      return json(await rcGet<any>(`/projects/${projectId}/customers/${args.customer_id}`));
-    }
+      return textResult(
+        await rcGet<RcCustomer>(
+          `/projects/${projectId}/customers/${encodeURIComponent(args.customer_id)}`
+        )
+      );
+    })
   );
+}
 
+// ---------------------------------------------------------------------------
+// rc_get_customer_subscriptions
+// ---------------------------------------------------------------------------
+
+const customerScopedSchema = z
+  .object({
+    project_id: projectIdField,
+    customer_id: z.string().min(1),
+  })
+  .strict();
+
+function registerGetCustomerSubscriptions(register: RegisterFn): void {
   register(
     {
       name: "rc_get_customer_subscriptions",
@@ -134,21 +274,29 @@ export function registerRevenueCatTools(register: RegisterFn): void {
       inputSchema: {
         type: "object",
         properties: {
-          project_id: projectIdSchema,
+          project_id: projectIdSchemaJson(),
           customer_id: { type: "string" },
         },
         required: ["customer_id"],
         additionalProperties: false,
       },
     },
-    async (args) => {
+    validated(customerScopedSchema, async (args) => {
       const projectId = resolveProjectId(args);
-      return json(
-        await rcGet<any>(`/projects/${projectId}/customers/${args.customer_id}/subscriptions`)
+      return textResult(
+        await rcGet(
+          `/projects/${projectId}/customers/${encodeURIComponent(args.customer_id)}/subscriptions`
+        )
       );
-    }
+    })
   );
+}
 
+// ---------------------------------------------------------------------------
+// rc_get_customer_purchases
+// ---------------------------------------------------------------------------
+
+function registerGetCustomerPurchases(register: RegisterFn): void {
   register(
     {
       name: "rc_get_customer_purchases",
@@ -156,18 +304,69 @@ export function registerRevenueCatTools(register: RegisterFn): void {
       inputSchema: {
         type: "object",
         properties: {
-          project_id: projectIdSchema,
+          project_id: projectIdSchemaJson(),
           customer_id: { type: "string" },
         },
         required: ["customer_id"],
         additionalProperties: false,
       },
     },
-    async (args) => {
+    validated(customerScopedSchema, async (args) => {
       const projectId = resolveProjectId(args);
-      return json(
-        await rcGet<any>(`/projects/${projectId}/customers/${args.customer_id}/purchases`)
+      return textResult(
+        await rcGet(
+          `/projects/${projectId}/customers/${encodeURIComponent(args.customer_id)}/purchases`
+        )
       );
-    }
+    })
+  );
+}
+
+// ---------------------------------------------------------------------------
+// rc_get_project_snapshot
+// ---------------------------------------------------------------------------
+
+const projectSnapshotSchema = z
+  .object({
+    project_id: projectIdField,
+  })
+  .strict();
+
+function registerGetProjectSnapshot(register: RegisterFn): void {
+  register(
+    {
+      name: "rc_get_project_snapshot",
+      description:
+        "One-shot overview of a RevenueCat project: apps, products, entitlements, and a small " +
+        "customer sample. Cuts 4+ tool calls down to 1 when you want the big picture of a project.",
+      inputSchema: {
+        type: "object",
+        properties: { project_id: projectIdSchemaJson() },
+        additionalProperties: false,
+      },
+    },
+    validated(projectSnapshotSchema, async (args) => {
+      const projectId = resolveProjectId(args);
+      // Run in parallel — none of these depend on the others.
+      const [apps, products, entitlements, customers] = await Promise.all([
+        rcGet<RcListResponse<RcApp>>(`/projects/${projectId}/apps`),
+        rcGet<RcListResponse<RcProduct>>(`/projects/${projectId}/products?limit=100`),
+        rcGet<RcListResponse<RcEntitlement>>(`/projects/${projectId}/entitlements`),
+        rcGet<RcListResponse<RcCustomer>>(`/projects/${projectId}/customers?limit=10`),
+      ]);
+      return textResult({
+        project_id: projectId,
+        apps: apps.items,
+        products: products.items,
+        entitlements: entitlements.items,
+        recent_customers: customers.items,
+        counts: {
+          apps: apps.items.length,
+          products: products.items.length,
+          entitlements: entitlements.items.length,
+          recent_customers_shown: customers.items.length,
+        },
+      });
+    })
   );
 }
