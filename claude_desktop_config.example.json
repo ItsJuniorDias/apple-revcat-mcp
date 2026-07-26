@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "apple-revcat": {
+      "command": "node",
+      "args": ["/CAMINHO/ABSOLUTO/apple-revcat-mcp/dist/index.js"],
+      "env": {
+        "ASC_KEY_ID": "XXXXXXXXXX",
+        "ASC_ISSUER_ID": "00000000-0000-0000-0000-000000000000",
+        "ASC_PRIVATE_KEY_PATH": "/CAMINHO/ABSOLUTO/apple-revcat-mcp/keys/AuthKey_XXXXXXXXXX.p8",
+        "ASC_VENDOR_NUMBER": "00000000",
+        "RC_SECRET_KEY": "sk_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+        "RC_DEFAULT_PROJECT_ID": ""
+      }
+    }
+  }
+}
