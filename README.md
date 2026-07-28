@@ -3,9 +3,10 @@
 MCP server pro Claude Desktop que expõe:
 
 - **App Store Connect API** — apps, sales reports, subscription reports, subscription events, customer reviews, developer responses
+- **App Store Analytics Reports API** — funnel de aquisição (impressions → PPV → downloads) por country × source, sessions, retention, crashes (async pipeline: create request → esperar 24-48h → puxar segments)
 - **RevenueCat API v2** — projects, apps, products, entitlements, customers, subscriptions, purchases
 
-Pensado pra indie dev iOS que quer consultar métricas do portfólio direto no chat sem abrir 3 dashboards. Inclui tools de agregação (geo/pricing conversion, cross-app snapshot) pra decisões de campanha e pricing sem parsear TSV na mão.
+Pensado pra indie dev iOS que quer consultar métricas do portfólio direto no chat sem abrir 3 dashboards. Inclui tools de agregação (geo/pricing conversion, cross-app snapshot, engagement funnel) pra decisões de campanha e pricing sem parsear TSV na mão.
 
 **Não inclui Apple Search Ads.** ASA Basic não expõe API — só o dashboard `ads.apple.com`. Se um dia migrar pra Advanced, dá pra adicionar as tools.
 
@@ -26,7 +27,7 @@ Pensado pra indie dev iOS que quer consultar métricas do portfólio direto no c
 
 1. Vai em **App Store Connect → Users and Access → Integrations → App Store Connect API**
 2. Clica em **Generate API Key**
-3. Role: `Admin` (recomendado — dá acesso a reviews response) ou `Finance` (mínimo pra sales reports; não permite responder review)
+3. Role: `Admin` (recomendado — cobre tudo, incluindo reviews response e o primeiro create do Analytics Report Request) ou `Finance` / `Sales and Reports` (mínimo pra sales reports; não permite responder review NEM criar Analytics Report Request pela primeira vez)
 4. Anota:
    - **Issuer ID** (topo da página, formato UUID)
    - **Key ID** (10 caracteres, ex: `AB12CD34EF`)
@@ -108,20 +109,33 @@ Um ícone 🔨 aparece no chat quando ele chama uma tool.
 
 ## 6. Tools disponíveis
 
-### App Store Connect (8 tools)
+### App Store Connect — Sales & Reviews (8 tools)
 
 | Tool | O que faz |
 |---|---|
 | `asc_list_apps` | Lista apps do dev (id, nome, bundleId, sku, primaryLocale) |
 | `asc_get_sales_report` | Baixa qualquer report (SALES / SUBSCRIPTION / SUBSCRIPTION_EVENT / SUBSCRIBER / PRE_ORDER) em TSV. Truncate por linha, header preservado. |
 | `asc_get_subscription_events` | Atalho: SUBSCRIPTION_EVENT diário. `reportDate` opcional (default = ontem no fuso Apple, PST). |
-| `asc_get_subscription_events_range` ⭐ | Agrega N dias em uma chamada. `daysBack: 14` ou `startDate`/`endDate`. Retorna JSON pronto ou TSV concatenado. |
-| `asc_get_geo_conversion_summary` ⭐ | Agrega SUBSCRIPTION_EVENT por país × SKU. Retorna trials, converts, cancels, refunds e conversion rate. **Feito pra validar geo targeting de campanhas ASA.** |
-| `asc_list_all_apps_snapshot` ⭐ | One-shot: apps + SALES + SUBSCRIPTION_EVENT de um dia agregados por SKU. Substitui 3 chamadas. |
+| `asc_get_subscription_events_range` | Agrega N dias em uma chamada. `daysBack: 14` ou `startDate`/`endDate`. Retorna JSON pronto ou TSV concatenado. |
+| `asc_get_geo_conversion_summary` | Agrega SUBSCRIPTION_EVENT por país × SKU. Retorna trials, converts, cancels, refunds e conversion rate. **Feito pra validar geo targeting de campanhas ASA.** |
+| `asc_list_all_apps_snapshot` | One-shot: apps + SALES + SUBSCRIPTION_EVENT de um dia agregados por SKU. Substitui 3 chamadas. |
 | `asc_list_customer_reviews` | Reviews recentes, filtro por país. Inclui `developerResponse` (se tu já respondeu). |
-| `asc_reply_to_review` ⭐ | Responde review direto do chat. Requer role Admin ou Customer Support na API key. Max 5970 chars. |
+| `asc_reply_to_review` | Responde review direto do chat. Requer role Admin ou Customer Support na API key. Max 5970 chars. |
 
-### RevenueCat (9 tools)
+### App Store Analytics Reports API (6 tools) 🆕 v0.3
+
+Pipeline assíncrono: cria um report request → espera 24-48h → puxa reports/instances/segments → parse TSV. Distinto do Sales Report acima — traz **funnel de aquisição** (impressions, product page views, downloads by source × country), sessions/retention/crashes, uso de frameworks e performance. Categorias: `APP_STORE_ENGAGEMENT`, `APP_USAGE`, `COMMERCE`, `FRAMEWORKS_USAGE`, `PERFORMANCE`.
+
+| Tool | O que faz |
+|---|---|
+| `asc_list_analytics_report_requests` | Lista requests já criados pro app. `accessType` = ONGOING (diário/semanal/mensal recorrente) ou ONE_TIME_SNAPSHOT (dump histórico). Sinaliza `stoppedDueToInactivity` (Apple pausa se ninguém puxa por muito tempo). |
+| `asc_create_analytics_report_request` | Cria request novo. **Primeira criação exige role Admin.** Primeiros dados chegam 24-48h depois. |
+| `asc_list_analytics_reports` | Dado um request, lista os reports disponíveis por category (ex: "App Store Discovery and Engagement Standard"). |
+| `asc_list_analytics_report_instances` | Dado um report, lista instâncias (uma por processingDate × granularity). Filtro `processingDate: YYYY-MM-DD` pra bater num dia específico. |
+| `asc_get_analytics_report_segments` | Baixa TODOS os segments de uma instância em paralelo, junta o TSV (com deduplicação de header) e retorna JSON parseado com colunas + rows, ou TSV bruto. |
+| `asc_get_engagement_funnel` ⭐ | **Wrapper high-level.** Dado `appId` e `daysBack`, resolve tudo automagicamente: acha o report de engagement, puxa instances diárias, baixa segments, e agrega **funnel (impressions → PPV → downloads → conversion rate) por Territory × Source Type**. Isso é o que tu quer pra otimizar ASA / entender orgânico vs pago. |
+
+### RevenueCat v2 (9 tools)
 
 | Tool | O que faz |
 |---|---|
@@ -133,9 +147,9 @@ Um ícone 🔨 aparece no chat quando ele chama uma tool.
 | `rc_get_customer` | Detalhe de um customer por `app_user_id` |
 | `rc_get_customer_subscriptions` | Subs ativas/expiradas |
 | `rc_get_customer_purchases` | Transactions |
-| `rc_get_project_snapshot` ⭐ | apps + products + entitlements + 10 customers recentes em UMA chamada |
+| `rc_get_project_snapshot` | apps + products + entitlements + 10 customers recentes em UMA chamada |
 
-⭐ = tools novos na v0.2
+⭐ = wrapper high-level, sempre a primeira escolha antes de descer pra tools de baixo nível.
 
 ---
 
@@ -143,6 +157,9 @@ Um ícone 🔨 aparece no chat quando ele chama uma tool.
 
 **"Onde vale investir mais em ASA?"**
 → `asc_get_geo_conversion_summary` com `daysBack: 14`. Ordena por trials, olha `conversionRate` por país. País com alto trial mas baixa conversão = LTV baixo ou pricing errado.
+
+**"ASA tá ganhando auction? Onde meu app aparece pra usuário?"**
+→ `asc_get_engagement_funnel` com `daysBack: 7`. Cruza impressions × PPV × downloads por Territory × Source Type. Se impressions em Search estão altas mas PPV baixo = teu creative/screenshot não atrai. Se PPV alto mas downloads baixo = preço, screenshots ou descrição travam a conversão. Pré-requisito: `asc_create_analytics_report_request` com `accessType: ONGOING` (uma vez, com Admin key), esperar 24-48h. Depois roda quanto quiser.
 
 **"Cross-app comparação rápida"**
 → `asc_list_all_apps_snapshot`. Se algum app zerou downloads ou trials, vai aparecer óbvio.
@@ -169,6 +186,16 @@ Um ícone 🔨 aparece no chat quando ele chama uma tool.
 
 **"Report not found" em datas antigas** — Weekly report precisa ser um **domingo**. Monthly é `YYYY-MM`, yearly é `YYYY`.
 
+**`asc_get_engagement_funnel` retorna `status: "no_report_request"`** — nunca criou um Analytics Report Request pra esse app. Roda `asc_create_analytics_report_request` com `accessType: ONGOING` uma vez (precisa Admin key na primeira vez pra cada app) e espera 24-48h. Depois `asc_get_engagement_funnel` responde direto.
+
+**`asc_get_engagement_funnel` retorna `status: "created_wait_for_data"`** — tu passou `autoCreate: true` e o request acabou de ser criado. Espera 24-48h e tenta de novo.
+
+**Instances vazias (`rowCount: 0`) em dias recentes** — Apple tem lag de 24-48h pra publicar o primeiro report ONGOING e depois +2 dias pra dados serem considerados completos. Pra dados de "ontem" ou "hoje" é normal vir vazio; tenta 3-4 dias atrás.
+
+**403 em `asc_create_analytics_report_request`** — a key não tem role Admin. Primeira criação por app exige Admin; depois disso, Sales-and-Reports ou Finance conseguem ler.
+
+**Request em `stoppedDueToInactivity: true`** — Apple pausou porque ninguém consumiu por muito tempo. Cria um novo com `asc_create_analytics_report_request`.
+
 **RevenueCat 401** — Tá usando public/mobile key ao invés de v2 secret (`sk_...`). Confere o prefixo — o server checa antes de enviar.
 
 **Claude Desktop não vê o server** — Cmd+Q completo? Path absoluto? Rodou `npm run build`? Logs em `~/Library/Logs/Claude/mcp*.log`.
@@ -177,7 +204,7 @@ Um ícone 🔨 aparece no chat quando ele chama uma tool.
 ```bash
 node dist/index.js
 ```
-Se aparecer `[apple-revcat-mcp] Ready with 17 tools.` no stderr, tá tudo ok.
+Se aparecer `[apple-revcat-mcp] Ready with 23 tools.` no stderr, tá tudo ok.
 
 ---
 
@@ -196,7 +223,7 @@ Se aparecer `[apple-revcat-mcp] Ready with 17 tools.` no stderr, tá tudo ok.
 
 ## 10. Próximos passos possíveis
 
-- **App Analytics API** — impressions, page views, install source por app. É async (create job → poll → download), então gasta 2-3 chamadas. Útil pra separar orgânico vs ASA.
+- **Wrappers pra App Usage e Performance** — no mesmo padrão do `asc_get_engagement_funnel`, mas pras categorias `APP_USAGE` (sessions, retention, uninstalls) e `PERFORMANCE` (crashes por versão). Toda a plumbaria assíncrona (create → instances → segments) já tá pronta em `src/asc/analytics.ts`; só falta a agregação específica de cada dataset.
 - **In-App Purchases + Subscriptions metadata** — read/update pricing, intro offers.
 - **TestFlight** — builds, testers, feedback.
 - **RevenueCat Metrics API** — se/quando expôr MRR/churn no v2 público (hoje só via Charts privado).

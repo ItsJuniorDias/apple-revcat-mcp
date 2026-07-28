@@ -6,6 +6,17 @@ import { getVendorNumber } from "./auth.js";
 import { textResult, validated } from "../utils/tool.js";
 import { parseTsv, truncateTsv } from "../utils/tsv.js";
 import { appleYesterday, appleDaysAgo, daysInRange, isValidYmd } from "../utils/dates.js";
+import {
+  createAnalyticsReportRequest,
+  downloadAllSegments,
+  findEngagementReport,
+  listAnalyticsReportInstances,
+  listAnalyticsReportRequests,
+  listAnalyticsReports,
+  type AnalyticsAccessType,
+  type AnalyticsGranularity,
+  type AnalyticsReportCategory,
+} from "./analytics.js";
 import type {
   AscApp,
   AscAppAttributes,
@@ -48,6 +59,13 @@ export function registerAscTools(register: RegisterFn): void {
   registerListAllAppsSnapshot(register);
   registerListCustomerReviews(register);
   registerReplyToReview(register);
+  // ----- Analytics Reports API (async pipeline; separate from Sales/Trends) -----
+  registerListAnalyticsReportRequests(register);
+  registerCreateAnalyticsReportRequest(register);
+  registerListAnalyticsReports(register);
+  registerListAnalyticsReportInstances(register);
+  registerGetAnalyticsReportSegments(register);
+  registerGetEngagementFunnel(register);
 }
 
 // ---------------------------------------------------------------------------
@@ -575,6 +593,545 @@ function registerReplyToReview(register: RegisterFn): void {
 }
 
 // ---------------------------------------------------------------------------
+// Analytics Reports API — shared schemas
+// ---------------------------------------------------------------------------
+
+const accessTypeSchema = z.enum(["ONGOING", "ONE_TIME_SNAPSHOT"]);
+
+const analyticsCategorySchema = z.enum([
+  "APP_USAGE",
+  "APP_STORE_ENGAGEMENT",
+  "COMMERCE",
+  "FRAMEWORKS_USAGE",
+  "PERFORMANCE",
+]);
+
+const granularitySchema = z.enum(["DAILY", "WEEKLY", "MONTHLY"]);
+
+// ---------------------------------------------------------------------------
+// asc_list_analytics_report_requests
+// ---------------------------------------------------------------------------
+
+const listReportRequestsSchema = z
+  .object({
+    appId: z.string().min(1),
+    accessType: accessTypeSchema.optional(),
+  })
+  .strict();
+
+function registerListAnalyticsReportRequests(register: RegisterFn): void {
+  register(
+    {
+      name: "asc_list_analytics_report_requests",
+      description:
+        "List analytics report requests already created for an app. Read-only. " +
+        "Returns { id, accessType (ONGOING|ONE_TIME_SNAPSHOT), stoppedDueToInactivity }. " +
+        "Use this before asc_create_analytics_report_request to avoid creating a duplicate. " +
+        "If stoppedDueToInactivity=true, Apple has paused that request and you'll need to " +
+        "create a new one to resume ingestion.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          appId: { type: "string", description: "App id (from asc_list_apps)." },
+          accessType: {
+            type: "string",
+            enum: ["ONGOING", "ONE_TIME_SNAPSHOT"],
+            description: "Filter by access type. Omit to return both.",
+          },
+        },
+        required: ["appId"],
+        additionalProperties: false,
+      },
+    },
+    validated(listReportRequestsSchema, async (args) => {
+      const requests = await listAnalyticsReportRequests(args.appId, args.accessType);
+      return textResult({
+        appId: args.appId,
+        count: requests.length,
+        requests: requests.map((r) => ({
+          id: r.id,
+          accessType: r.attributes?.accessType,
+          stoppedDueToInactivity: r.attributes?.stoppedDueToInactivity ?? false,
+        })),
+      });
+    })
+  );
+}
+
+// ---------------------------------------------------------------------------
+// asc_create_analytics_report_request
+// ---------------------------------------------------------------------------
+
+const createReportRequestSchema = z
+  .object({
+    appId: z.string().min(1),
+    accessType: accessTypeSchema.default("ONGOING"),
+  })
+  .strict();
+
+function registerCreateAnalyticsReportRequest(register: RegisterFn): void {
+  register(
+    {
+      name: "asc_create_analytics_report_request",
+      description:
+        "Create a new analytics report request for an app. This is the FIRST step to " +
+        "unlock the App Analytics data pipeline (impressions, product page views, " +
+        "downloads by source × country, sessions, retention, crashes, etc). " +
+        "accessType=ONGOING (default) starts recurring daily/weekly/monthly reports " +
+        "— the first data arrives ~24-48h after creation. accessType=ONE_TIME_SNAPSHOT " +
+        "gives you the full historical dump instead. " +
+        "First-time creation on an app requires the Admin role on the ASC API key; " +
+        "afterwards Sales-and-Reports / Finance keys can read from it. Call " +
+        "asc_list_analytics_report_requests first to avoid creating a duplicate.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          appId: { type: "string", description: "App id (from asc_list_apps)." },
+          accessType: {
+            type: "string",
+            enum: ["ONGOING", "ONE_TIME_SNAPSHOT"],
+            default: "ONGOING",
+          },
+        },
+        required: ["appId"],
+        additionalProperties: false,
+      },
+    },
+    validated(createReportRequestSchema, async (args) => {
+      const created = await createAnalyticsReportRequest(args.appId, args.accessType);
+      return textResult({
+        id: created.id,
+        accessType: created.attributes?.accessType ?? args.accessType,
+        stoppedDueToInactivity: created.attributes?.stoppedDueToInactivity ?? false,
+        notice:
+          args.accessType === "ONGOING"
+            ? "Request created. First report instances usually appear 24-48h later. " +
+              "Poll asc_list_analytics_report_instances after that window."
+            : "Snapshot request created. Historical data will be generated over the next 24-48h.",
+      });
+    })
+  );
+}
+
+// ---------------------------------------------------------------------------
+// asc_list_analytics_reports
+// ---------------------------------------------------------------------------
+
+const listReportsSchema = z
+  .object({
+    requestId: z.string().min(1),
+    category: analyticsCategorySchema.optional(),
+    nameContains: z
+      .string()
+      .min(1)
+      .optional()
+      .describe("Case-insensitive substring filter on report name (client-side)."),
+  })
+  .strict();
+
+function registerListAnalyticsReports(register: RegisterFn): void {
+  register(
+    {
+      name: "asc_list_analytics_reports",
+      description:
+        "List the report schemas available inside a report request. Each report is a " +
+        "specific dataset (e.g. 'App Store Discovery and Engagement Standard', " +
+        "'App Sessions Detailed'). Filter by category to narrow: " +
+        "APP_STORE_ENGAGEMENT (impressions, product page views, downloads by source), " +
+        "APP_USAGE (sessions, active devices, retention, crashes, uninstalls), " +
+        "COMMERCE (proceeds, transactions, subscription state), " +
+        "FRAMEWORKS_USAGE, PERFORMANCE. " +
+        "Returns { id, name, category }. Get the requestId from asc_list_analytics_report_requests.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          requestId: {
+            type: "string",
+            description: "Report request id (from asc_list_analytics_report_requests).",
+          },
+          category: {
+            type: "string",
+            enum: [
+              "APP_USAGE",
+              "APP_STORE_ENGAGEMENT",
+              "COMMERCE",
+              "FRAMEWORKS_USAGE",
+              "PERFORMANCE",
+            ],
+          },
+          nameContains: {
+            type: "string",
+            description: "Case-insensitive substring filter on report name.",
+          },
+        },
+        required: ["requestId"],
+        additionalProperties: false,
+      },
+    },
+    validated(listReportsSchema, async (args) => {
+      const reports = await listAnalyticsReports(args.requestId, args.category);
+      const needle = args.nameContains?.toLowerCase();
+      const filtered = needle
+        ? reports.filter((r) => (r.attributes?.name ?? "").toLowerCase().includes(needle))
+        : reports;
+      return textResult({
+        requestId: args.requestId,
+        count: filtered.length,
+        reports: filtered.map((r) => ({
+          id: r.id,
+          name: r.attributes?.name,
+          category: r.attributes?.category,
+        })),
+      });
+    })
+  );
+}
+
+// ---------------------------------------------------------------------------
+// asc_list_analytics_report_instances
+// ---------------------------------------------------------------------------
+
+const listInstancesSchema = z
+  .object({
+    reportId: z.string().min(1),
+    granularity: granularitySchema.optional(),
+    processingDate: ymdSchema
+      .optional()
+      .describe("YYYY-MM-DD (report's local processing date, not calendar date)."),
+    limit: z.number().int().min(1).max(200).default(50),
+  })
+  .strict();
+
+function registerListAnalyticsReportInstances(register: RegisterFn): void {
+  register(
+    {
+      name: "asc_list_analytics_report_instances",
+      description:
+        "List instances of a specific report — each instance is one date at one " +
+        "granularity (DAILY/WEEKLY/MONTHLY). Returns { id, granularity, processingDate }. " +
+        "Filter by granularity to avoid mixing daily/weekly/monthly. Filter by " +
+        "processingDate for a specific day. If empty for a recent date, either the report " +
+        "hasn't been generated yet (24-48h lag) or the data isn't ready (2-day completeness).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          reportId: {
+            type: "string",
+            description: "Report id (from asc_list_analytics_reports).",
+          },
+          granularity: {
+            type: "string",
+            enum: ["DAILY", "WEEKLY", "MONTHLY"],
+          },
+          processingDate: {
+            type: "string",
+            description: "YYYY-MM-DD to filter to one specific date.",
+          },
+          limit: { type: "integer", minimum: 1, maximum: 200, default: 50 },
+        },
+        required: ["reportId"],
+        additionalProperties: false,
+      },
+    },
+    validated(listInstancesSchema, async (args) => {
+      const instances = await listAnalyticsReportInstances(args.reportId, {
+        granularity: args.granularity,
+        processingDate: args.processingDate,
+        limit: args.limit,
+      });
+      // Newest first — most callers want the latest data.
+      instances.sort((a, b) =>
+        (b.attributes?.processingDate ?? "").localeCompare(a.attributes?.processingDate ?? "")
+      );
+      return textResult({
+        reportId: args.reportId,
+        count: instances.length,
+        instances: instances.map((i) => ({
+          id: i.id,
+          granularity: i.attributes?.granularity,
+          processingDate: i.attributes?.processingDate,
+        })),
+      });
+    })
+  );
+}
+
+// ---------------------------------------------------------------------------
+// asc_get_analytics_report_segments
+// ---------------------------------------------------------------------------
+
+const getSegmentsSchema = z
+  .object({
+    instanceId: z.string().min(1),
+    format: z.enum(["json", "tsv"]).default("json"),
+    maxLines: z.number().int().min(50).max(5000).default(400),
+    maxRows: z
+      .number()
+      .int()
+      .min(50)
+      .max(5000)
+      .default(400)
+      .describe("For format=json, max rows returned in `rows`. `rowCount` is always full."),
+  })
+  .strict();
+
+function registerGetAnalyticsReportSegments(register: RegisterFn): void {
+  register(
+    {
+      name: "asc_get_analytics_report_segments",
+      description:
+        "Downloads every segment of a report instance, decompresses the gzipped TSV, " +
+        "and returns the data. format=json (default) parses rows into { column: value } " +
+        "objects and reports column names — ideal for the model to reason about the data. " +
+        "format=tsv returns the raw concatenated TSV (with duplicate headers stripped). " +
+        "Big instances have multiple segments; they're fetched in parallel.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          instanceId: {
+            type: "string",
+            description: "Instance id (from asc_list_analytics_report_instances).",
+          },
+          format: {
+            type: "string",
+            enum: ["json", "tsv"],
+            default: "json",
+          },
+          maxLines: {
+            type: "integer",
+            minimum: 50,
+            maximum: 5000,
+            default: 400,
+            description: "For format=tsv, max lines returned (header preserved).",
+          },
+          maxRows: {
+            type: "integer",
+            minimum: 50,
+            maximum: 5000,
+            default: 400,
+            description: "For format=json, max rows returned. rowCount is always the full total.",
+          },
+        },
+        required: ["instanceId"],
+        additionalProperties: false,
+      },
+    },
+    validated(getSegmentsSchema, async (args) => {
+      const dl = await downloadAllSegments(args.instanceId);
+      if (dl.segmentCount === 0) {
+        return textResult({
+          instanceId: args.instanceId,
+          segmentCount: 0,
+          notice:
+            "This instance has no segments — Apple hasn't finished generating it yet, " +
+            "or the underlying data is empty for the day.",
+        });
+      }
+      if (args.format === "tsv") {
+        return textResult(truncateTsv(dl.tsv, args.maxLines));
+      }
+      const rows = parseTsv(dl.tsv);
+      const columns = rows.length > 0 ? Object.keys(rows[0]!) : [];
+      const truncated = rows.length > args.maxRows;
+      return textResult({
+        instanceId: args.instanceId,
+        segmentCount: dl.segmentCount,
+        bytes: dl.bytes,
+        columns,
+        rowCount: rows.length,
+        truncated,
+        rows: truncated ? rows.slice(0, args.maxRows) : rows,
+      });
+    })
+  );
+}
+
+// ---------------------------------------------------------------------------
+// asc_get_engagement_funnel
+// ---------------------------------------------------------------------------
+
+const engagementFunnelSchema = z
+  .object({
+    appId: z.string().min(1),
+    daysBack: z.number().int().min(1).max(30).default(7),
+    granularity: granularitySchema.default("DAILY"),
+    autoCreate: z
+      .boolean()
+      .default(false)
+      .describe(
+        "If true and no ONGOING request exists, create one automatically. Note: creation " +
+          "requires the Admin role and data only becomes available 24-48h later."
+      ),
+    detailed: z
+      .boolean()
+      .default(false)
+      .describe(
+        "Prefer the Detailed variant of the engagement report (adds Source Info, Campaign ID, " +
+          "Page Title). Much bigger payload; only enable if you need paid-campaign attribution."
+      ),
+    maxSampleRows: z
+      .number()
+      .int()
+      .min(0)
+      .max(500)
+      .default(50)
+      .describe("Sample rows returned alongside the aggregate (for schema inspection). 0 = none."),
+  })
+  .strict();
+
+function registerGetEngagementFunnel(register: RegisterFn): void {
+  register(
+    {
+      name: "asc_get_engagement_funnel",
+      description:
+        "High-level wrapper: fetches the App Store Engagement report for an app and " +
+        "aggregates the funnel (impressions → product page views → downloads → conversion) " +
+        "by Territory × Source Type for the last N days. This is what you want for ASA " +
+        "geo optimization and 'is Search Ads winning auctions here?' questions. " +
+        "Requires that an analyticsReportRequest already exists for the app — call " +
+        "asc_list_analytics_report_requests first, or set autoCreate=true. Data lags 24-48h.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          appId: { type: "string", description: "App id (from asc_list_apps)." },
+          daysBack: {
+            type: "integer",
+            minimum: 1,
+            maximum: 30,
+            default: 7,
+            description: "How many recent days to fetch (max 30).",
+          },
+          granularity: {
+            type: "string",
+            enum: ["DAILY", "WEEKLY", "MONTHLY"],
+            default: "DAILY",
+          },
+          autoCreate: {
+            type: "boolean",
+            default: false,
+            description:
+              "Create an ONGOING request if none exists (needs Admin role, 24-48h wait).",
+          },
+          detailed: {
+            type: "boolean",
+            default: false,
+            description: "Use the Detailed engagement report variant.",
+          },
+          maxSampleRows: {
+            type: "integer",
+            minimum: 0,
+            maximum: 500,
+            default: 50,
+          },
+        },
+        required: ["appId"],
+        additionalProperties: false,
+      },
+    },
+    validated(engagementFunnelSchema, async (args) => {
+      let report = await findEngagementReport(args.appId, { preferDetailed: args.detailed });
+
+      if (!report) {
+        if (!args.autoCreate) {
+          return textResult({
+            status: "no_report_request",
+            appId: args.appId,
+            hint:
+              "No active analyticsReportRequest exists for this app. Call " +
+              "asc_create_analytics_report_request with accessType=ONGOING (requires " +
+              "Admin role) and wait 24-48h, or set autoCreate=true on this call.",
+          });
+        }
+        const created = await createAnalyticsReportRequest(args.appId, "ONGOING");
+        return textResult({
+          status: "created_wait_for_data",
+          appId: args.appId,
+          createdRequestId: created.id,
+          notice:
+            "Created a new ONGOING report request. Apple takes 24-48h to publish " +
+            "the first instance. Retry asc_get_engagement_funnel after that window.",
+        });
+      }
+
+      // For each day in the window, list DAILY instances and download them.
+      // We do this per-day rather than one big list call so we can bound the
+      // number of instances we pull even for busy apps.
+      const dates: string[] = [];
+      for (let i = 1; i <= args.daysBack; i++) dates.push(appleDaysAgo(i));
+
+      type PerDay = {
+        date: string;
+        instanceId: string | null;
+        rows: Record<string, string>[];
+        error?: string;
+      };
+
+      const concurrency = Math.min(4, dates.length);
+      const perDay: PerDay[] = [];
+      let cursor = 0;
+
+      async function worker(): Promise<void> {
+        while (cursor < dates.length) {
+          const idx = cursor++;
+          const date = dates[idx]!;
+          try {
+            const instances = await listAnalyticsReportInstances(report!.reportId, {
+              granularity: args.granularity,
+              processingDate: date,
+              limit: 1,
+            });
+            if (instances.length === 0) {
+              perDay.push({ date, instanceId: null, rows: [] });
+              continue;
+            }
+            const instanceId = instances[0]!.id;
+            const dl = await downloadAllSegments(instanceId);
+            const rows = dl.tsv ? parseTsv(dl.tsv) : [];
+            perDay.push({ date, instanceId, rows });
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            perDay.push({ date, instanceId: null, rows: [], error: msg });
+          }
+        }
+      }
+      await Promise.all(Array.from({ length: concurrency }, () => worker()));
+      perDay.sort((a, b) => a.date.localeCompare(b.date));
+
+      const allRows = perDay.flatMap((d) => d.rows);
+      const aggregate = aggregateEngagementRows(allRows);
+      const columns = allRows.length > 0 ? Object.keys(allRows[0]!) : [];
+
+      return textResult({
+        status: "ok",
+        appId: args.appId,
+        report: {
+          requestId: report.requestId,
+          reportId: report.reportId,
+          reportName: report.reportName,
+          accessType: report.accessType,
+        },
+        window: {
+          start: dates[dates.length - 1],
+          end: dates[0],
+          daysRequested: args.daysBack,
+          daysWithData: perDay.filter((d) => d.rows.length > 0).length,
+        },
+        perDay: perDay.map((d) => ({
+          date: d.date,
+          instanceId: d.instanceId,
+          rowCount: d.rows.length,
+          ...(d.error ? { error: d.error } : {}),
+        })),
+        columns,
+        totalRows: allRows.length,
+        aggregate,
+        sampleRows: args.maxSampleRows > 0 ? allRows.slice(0, args.maxSampleRows) : [],
+      });
+    })
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Internal helpers (subscription event fetch, aggregation, snapshot merge)
 // ---------------------------------------------------------------------------
 
@@ -808,4 +1365,126 @@ function mergeSnapshotBySku(
       cancels: sub?.cancels ?? 0,
     };
   });
+}
+
+/**
+ * Aggregates rows from the App Store Engagement report into a Territory ×
+ * Source Type funnel: impressions → product page views → downloads with a
+ * derived conversionRate.
+ *
+ * Column names in Apple's engagement TSV have shifted between spec versions
+ * — we accept a few known aliases per field so a rename doesn't zero out the
+ * aggregate silently. Event values also vary: some reports emit "Impression"
+ * as a discrete row, others report impressions as a column on a Page view
+ * row. We handle both shapes.
+ */
+function aggregateEngagementRows(rows: Record<string, string>[]): {
+  byTerritorySource: Array<{
+    territory: string;
+    sourceType: string;
+    impressions: number;
+    productPageViews: number;
+    downloads: number;
+    conversionRate: number | null;
+  }>;
+  eventTotals: Record<string, number>;
+  totals: {
+    impressions: number;
+    productPageViews: number;
+    downloads: number;
+    conversionRate: number | null;
+  };
+} {
+  type Bucket = {
+    territory: string;
+    sourceType: string;
+    impressions: number;
+    productPageViews: number;
+    downloads: number;
+  };
+  const buckets = new Map<string, Bucket>();
+  const eventTotals: Record<string, number> = {};
+
+  for (const row of rows) {
+    const territory = row["Territory"] ?? row["Country"] ?? row["Region"] ?? "??";
+    const sourceType =
+      row["Source Type"] ?? row["Source"] ?? row["Traffic Source"] ?? "Unknown";
+    const event =
+      row["Event"] ??
+      row["Engagement Type"] ??
+      row["Metric"] ??
+      row["Event Type"] ??
+      "";
+    // Some Apple reports use "Counts" (integer sum) and "Unique Devices" side
+    // by side. We track Counts as the primary value — that's what the ASC UI
+    // displays for impressions/PPV/downloads by default.
+    const counts = Number(row["Counts"] ?? row["Count"] ?? row["Units"] ?? "0") || 0;
+
+    if (event) {
+      eventTotals[event] = (eventTotals[event] ?? 0) + counts;
+    }
+
+    const key = `${territory}|${sourceType}`;
+    if (!buckets.has(key)) {
+      buckets.set(key, {
+        territory,
+        sourceType,
+        impressions: 0,
+        productPageViews: 0,
+        downloads: 0,
+      });
+    }
+    const b = buckets.get(key)!;
+
+    // Match event to the funnel stages. Naming varies across report versions;
+    // the substring tests catch "First-Time Download", "Total Downloads",
+    // "Product Page View" etc without hardcoding every spelling.
+    const lower = event.toLowerCase();
+    if (lower === "impression" || lower.includes("impression")) {
+      b.impressions += counts;
+    } else if (
+      lower.includes("product page view") ||
+      lower === "page view" ||
+      lower.includes("page view")
+    ) {
+      b.productPageViews += counts;
+    } else if (lower.includes("download") || lower.includes("install")) {
+      b.downloads += counts;
+    }
+    // Silently ignore events that don't map to a funnel stage (Session, Tap
+    // through, Notification, etc). They're preserved in eventTotals for the
+    // caller to inspect.
+  }
+
+  const byTerritorySource = [...buckets.values()]
+    .map((b) => ({
+      ...b,
+      conversionRate:
+        b.productPageViews > 0
+          ? Math.round((b.downloads / b.productPageViews) * 1000) / 1000
+          : null,
+    }))
+    // Sort by downloads desc — that's the metric people scan for first.
+    .sort((a, b) => b.downloads - a.downloads);
+
+  const totals = byTerritorySource.reduce(
+    (acc, b) => ({
+      impressions: acc.impressions + b.impressions,
+      productPageViews: acc.productPageViews + b.productPageViews,
+      downloads: acc.downloads + b.downloads,
+    }),
+    { impressions: 0, productPageViews: 0, downloads: 0 }
+  );
+
+  return {
+    byTerritorySource,
+    eventTotals,
+    totals: {
+      ...totals,
+      conversionRate:
+        totals.productPageViews > 0
+          ? Math.round((totals.downloads / totals.productPageViews) * 1000) / 1000
+          : null,
+    },
+  };
 }
