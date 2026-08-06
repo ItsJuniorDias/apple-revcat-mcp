@@ -91,6 +91,54 @@ Fecha o Claude Desktop **completamente** (`Cmd+Q`) e abre de novo.
 
 ---
 
+## 4b. Alternativa: modo HTTP (claude.ai web/mobile)
+
+O passo 4 acima cobre **stdio** (Claude Desktop). Se tu quiser plugar o
+MCP no **claude.ai web/mobile** ou usar como custom connector qualquer,
+precisa rodar em modo **Streamable HTTP** e expor a porta via túnel
+(cloudflared / ngrok) ou host próprio.
+
+```bash
+# 1. Copia o .env
+cp .env.example .env
+
+# 2. Preenche credenciais do ASC/RC + gera um bearer token
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+# → cola no MCP_AUTH_TOKEN= dentro de .env
+
+# 3. Sobe o servidor
+npm run build
+npm run start:http
+# → HTTP transport listening on http://127.0.0.1:3333/mcp
+
+# 4. Em outra aba, sobe o túnel
+cloudflared tunnel --url http://localhost:3333
+# → https://<random>.trycloudflare.com
+```
+
+Depois no claude.ai: **Settings → Connectors → +Add custom connector**,
+cola `https://<random>.trycloudflare.com/mcp`, e em **Advanced settings
+→ Request headers** adiciona header `Authorization` com valor
+`Bearer <MCP_AUTH_TOKEN>`.
+
+Detalhes completos, health check, e troubleshooting em
+[`claude_web_connector.example.md`](./claude_web_connector.example.md).
+
+**Notas:**
+- Os dois modos (stdio + HTTP) coexistem: mesma build, entrypoints
+  diferentes (`dist/index.js` vs `dist/http.js`). Tu pode ter os dois
+  rodando em paralelo.
+- Modo HTTP é **stateless** — cada request cria server + transport
+  novos. Sem persistência, sem session ID.
+- **Auth é obrigatório**: se `MCP_AUTH_TOKEN` não estiver setado ou
+  tiver menos de 16 chars, o servidor recusa subir. Túnel público sem
+  auth = suas chaves ASC/RC expostas.
+- Credenciais ASC/RC **não trafegam pelo túnel** — o Claude.ai só manda
+  chamadas MCP; a autenticação com Apple/RevenueCat sai do teu processo
+  local direto.
+
+---
+
 ## 5. Testar
 
 No Claude Desktop:

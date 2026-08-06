@@ -9,7 +9,8 @@
         "ASC_PRIVATE_KEY_PATH": "/CAMINHO/ABSOLUTO/apple-revcat-mcp/keys/AuthKey_XXXXXXXXXX.p8",
         "ASC_VENDOR_NUMBER": "00000000",
         "RC_SECRET_KEY": "sk_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
-        "RC_DEFAULT_PROJECT_ID": ""
+        "RC_DEFAULT_PROJECT_ID": "",
+        "MCP_AUTH_TOKEN": "8ed01e622306d9fb420a43cc37706c407af714a6a2b91d40f386e1e0932dab72"
       }
     }
   }
